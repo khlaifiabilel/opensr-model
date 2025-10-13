@@ -28,8 +28,8 @@ def download_file(url: str, destination: str) -> None:
 
 def main():
     """Download all required models from Hugging Face."""
-    # Create models directory if it doesn't exist
-    models_dir = Path(__file__).parent / "models"
+    # Set models directory to current directory (models/)
+    models_dir = Path(__file__).parent
     models_dir.mkdir(exist_ok=True)
     
     # Define models to download
