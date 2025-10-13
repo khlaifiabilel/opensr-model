@@ -13,110 +13,52 @@ import shutil
 import random
 import numpy as np
 from einops import rearrange
+from opensr_model.utils import suppress_stdout
 from opensr_model.utils import assert_tensor_validity
 from opensr_model.utils import revert_padding
+from opensr_model.utils import create_no_data_mask
+from opensr_model.utils import apply_no_data_mask
 
 
 
 class SRLatentDiffusion(torch.nn.Module):
-    def __init__(self, bands: str = "10m", device: Union[str, torch.device] = "cpu"):
+    def __init__(self,config, device: Union[str, torch.device] = "cpu"):
         super().__init__()
 
-        # Set parameters depending on band selection
-        self.band_config = bands
-        assert self.band_config in ["10m", "20m"], "band selection incorrect"
-
         # Set up the model
-        first_stage_config, cond_stage_config = self.set_model_settings()
+        self.config = config        
         self.model = LatentDiffusion(
-            first_stage_config,
-            cond_stage_config,
-            timesteps=1000,
-            unet_config=cond_stage_config,
-            linear_start=0.0015,
-            linear_end=0.0155,
-            concat_mode=True,
-            cond_stage_trainable=False,
-            first_stage_key="image",
-            cond_stage_key="LR_image",
+            config.first_stage_config,
+            config.cond_stage_config,
+            timesteps=config.denoiser_settings.timesteps,
+            unet_config=config.cond_stage_config,
+            linear_start=config.denoiser_settings.linear_start,
+            linear_end=config.denoiser_settings.linear_end,
+            concat_mode=config.other.concat_mode,
+            cond_stage_trainable=config.other.cond_stage_trainable,
+            first_stage_key=config.other.first_stage_key,
+            cond_stage_key=config.other.cond_stage_key,
         )
 
-        # set up mean/std - TODO: remove in future
-        #self.mean, self.std = self.set_mean_std()
 
         # Set up the model for inference
+        self.set_normalization() # decide wether to use norm
         self.device = device # set self device
         self.model.device = device # set model device as selected
         self.model = self.model.to(device) # move model to device
         self.model.eval() # set model state
+        self = self.eval() # set main model state
         self._X = None # placeholder for LR image
-        self.encode_conditioning = True # encode LR images before dif?
-        self.sr_type = "SISR" # set wether SISR or MIRS
+        self.encode_conditioning = config.encode_conditioning # encode LR images before dif?
 
-    def set_model_settings(self):
-        # set up model settings
-        if self.band_config == "10m":
-            print("Creating model for 4x 10m bands...")
-            first_stage_config = {
-                "embed_dim":4,
-                "double_z": True,
-                "z_channels": 4,
-                "resolution": 256,
-                "in_channels": 4,
-                "out_ch": 4,
-                "ch": 128,
-                "ch_mult": [1, 2, 4],
-                "num_res_blocks": 2,
-                "attn_resolutions": [],
-                "dropout": 0.0,
-            }
-            cond_stage_config = {
-                "image_size": 64,
-                "in_channels": 8,
-                "model_channels": 160,
-                "out_channels": 4,
-                "num_res_blocks": 2,
-                "attention_resolutions": [16, 8],
-                "channel_mult": [1, 2, 2, 4],
-                "num_head_channels": 32,
-            }
-            # set transform for 10m
+    def set_normalization(self):
+        if self.config.apply_normalization==True:
             from opensr_model.utils import linear_transform_4b
             self.linear_transform = linear_transform_4b
-
-            return first_stage_config, cond_stage_config
-
-        if self.band_config == "20m":
-            print("Creating model for 6x 20m bands...")
-            first_stage_config = {
-                "embed_dim":6,
-                "double_z": True,
-                "z_channels": 6,
-                "resolution": 512,
-                "in_channels": 6,
-                "out_ch": 6,
-                "ch": 128,
-                "ch_mult": [1, 2, 4],
-                "num_res_blocks": 2,
-                "attn_resolutions": [],
-                "dropout": 0.0,
-            }
-            cond_stage_config = {
-                "image_size": 64,
-                "in_channels": 12,
-                "model_channels": 160,
-                "out_channels": 6,
-                "num_res_blocks": 2,
-                "attention_resolutions": [16, 8],
-                "channel_mult": [1, 2, 2, 4],
-                "num_head_channels": 32,
-            }
-            # set transform for 20m
-            from opensr_model.utils import linear_transform_6b
-            self.linear_transform = linear_transform_6b
-            # return configs
-            return first_stage_config, cond_stage_config
-
+        else:
+            from opensr_model.utils import linear_transform_placeholder
+            self.linear_transform = linear_transform_placeholder
+            print("Normalization disabled.")
         
     def _tensor_encode(self,X: torch.Tensor):
         # set copy to model
@@ -124,8 +66,7 @@ class SRLatentDiffusion(torch.nn.Module):
         # normalize image
         X_enc = self.linear_transform(X, stage="norm")
         # encode LR images
-        self.encode_conditioning = True
-        if self.encode_conditioning==True and self.sr_type=="SISR":
+        if self.encode_conditioning==True :
             # try to upsample->encode conditioning
             X_int = torch.nn.functional.interpolate(X, size=(X.shape[-1]*4,X.shape[-1]*4), mode='bilinear', align_corners=False)
             # encode conditioning
@@ -168,14 +109,240 @@ class SRLatentDiffusion(torch.nn.Module):
         
         return ddim, latent, time_range
 
+    @torch.no_grad()
+    def forward(
+        self,
+        X: torch.Tensor,
+        sampling_eta: float = None,
+        sampling_steps: int = None,
+        sampling_temperature: float = None,
+        histogram_matching: bool = True,
+        save_iterations: bool = False,
+        verbose: bool = False
+    ):
+        """Obtain the super resolution of the given image.
+
+        Args:
+            X (torch.Tensor): If a Sentinel-2 L2A image with reflectance values
+                in the range [0, 1] and shape CxWxH, the super resolution of the image
+                is returned. If a batch of images with shape BxCxWxH is given, a batch
+                of super resolved images is returned.
+            sampling_steps (int, optional): Number of steps to run the denoiser. Defaults
+                to 100.
+            temperature (float, optional): Temperature to use in the denoiser.
+                Defaults to 1.0. The higher the temperature, the more stochastic
+                the denoiser is (random noise gets multiplied by this).
+            spectral_correction (bool, optional): Apply spectral correction to the SR
+                image, using the LR image as reference. Defaults to True.
+
+        Returns:
+            torch.Tensor: The super resolved image or batch of images with a shape of
+                Cx(Wx4)x(Hx4) or BxCx(Wx4)x(Hx4).
+        """
+        # fall back on config if args are None
+        if sampling_eta is None:
+            sampling_eta = self.config.denoiser_settings.sampling_eta
+        if sampling_temperature is None:
+            sampling_temperature = self.config.denoiser_settings.sampling_temperature
+        if sampling_steps is None:
+            sampling_steps = self.config.denoiser_settings.sampling_steps
+        
+        # Assert shape, size, dimensionality. Add padding if necessary
+        X,padding = assert_tensor_validity(X)
+        
+        # create no_data_mask
+        no_data_mask = create_no_data_mask(X, target_size= X.shape[-1]*4)
+
+        # Normalize the image
+        X = X.clone()
+        Xnorm = self._tensor_encode(X)
+        
+        # ddim, latent and time_range
+        ddim, latent, time_range = self._prepare_model(
+            X=Xnorm, eta=sampling_eta, custom_steps=sampling_steps, verbose=verbose
+        )
+        iterator = tqdm(time_range, desc="DDIM Sampler", total=sampling_steps,disable=True)
+
+        # Iterate over the timesteps
+        if save_iterations:
+            save_iters = []
+            
+        for i, step in enumerate(iterator):
+            outs = ddim.p_sample_ddim(
+                x=latent,
+                c=Xnorm,
+                t=step,
+                index=sampling_steps - i - 1,
+                use_original_steps=False,
+                temperature=sampling_temperature
+            )
+            latent, _ = outs
+            
+            if save_iterations:
+                save_iters.append(
+                    self._tensor_decode(latent, spe_cor=histogram_matching)
+                )
+        
+        if save_iterations:
+            return save_iters
+        
+        sr = self._tensor_decode(latent, spe_cor=histogram_matching) # decode the latent image
+        
+        # Post-processing
+        sr = apply_no_data_mask(sr, no_data_mask) # apply no data mask as in LR image
+        sr = revert_padding(sr,padding) # remove padding from the SR image if there was any
+        return sr
+
+
+    def hq_histogram_matching(
+        self, image1: torch.Tensor, image2: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Applies histogram matching to align the color distribution of image1 to image2.
+
+        This function adjusts the pixel intensity distribution of `image1` (typically the
+        low-resolution or degraded image) to match that of `image2` (typically the 
+        high-resolution or reference image). The operation is done per channel and 
+        assumes both images are in (C, H, W) format.
+
+        Args:
+            image1 (torch.Tensor): The source image whose histogram will be modified (C, H, W).
+            image2 (torch.Tensor): The reference image whose histogram will be matched (C, H, W).
+
+        Returns:
+            torch.Tensor: A new tensor with the same shape as `image1`, but with pixel 
+                        intensities adjusted to match the histogram of `image2`.
+
+        Raises:
+            ValueError: If input tensors are not 2D or 3D.
+        """
+
+        # Go to numpy
+        np_image1 = image1.detach().cpu().numpy()
+        np_image2 = image2.detach().cpu().numpy()
+
+        if np_image1.ndim == 3:
+            np_image1_hat = match_histograms(np_image1, np_image2, channel_axis=0)
+        elif np_image1.ndim == 2:
+            np_image1_hat = match_histograms(np_image1, np_image2, channel_axis=None)
+        else:
+            raise ValueError("The input image must have 2 or 3 dimensions.")
+
+        # Go back to torch
+        image1_hat = torch.from_numpy(np_image1_hat).to(image1.device)
+
+        return image1_hat
+
+    def load_pretrained(self, weights_file: str):
+        """
+        Loads pretrained model weights from a local file or downloads them from Hugging Face if not present.
+
+        If the specified `weights_file` does not exist locally, it is automatically downloaded from the 
+        Hugging Face model hub under `simon-donike/RS-SR-LTDF`. A progress bar is shown during download.
+
+        After loading, the method removes any perceptual loss-related weights from the state dict and 
+        loads the remaining weights into the model.
+
+        Args:
+            weights_file (str): Path to the local weights file. If the file is not found, it will be downloaded 
+                                using this name from the Hugging Face repository.
+
+        Raises:
+            RuntimeError: If the weights cannot be loaded or parsed correctly.
+
+        Example:
+            self.load_pretrained("model_weights.ckpt")
+        """
+
+        # download pretrained model
+        # create download link based on input 
+        hf_model = str("https://huggingface.co/simon-donike/RS-SR-LTDF/resolve/main/"+str(weights_file))
+        
+        # Total size in bytes.
+        if not pathlib.Path(weights_file).exists():
+            print("Downloading pretrained weights from: ", hf_model)
+            response = requests.get(hf_model, stream=True)
+            total_size = int(response.headers.get('content-length', 0))
+            block_size = 1024  # 1 Kibibyte
+            
+            # Open the file to write as binary - write bytes to a file
+            with open(weights_file, "wb") as f:
+                # Setup the progress bar
+                with tqdm(total=total_size, unit='iB', unit_scale=True, desc=weights_file) as bar:
+                    for data in response.iter_content(block_size):
+                        bar.update(len(data))
+                        f.write(data)
+
+        weights = torch.load(weights_file, map_location=self.device)["state_dict"]
+
+        # Remote perceptual tensors from weights
+        for key in list(weights.keys()):
+            if "loss" in key:
+                del weights[key]
+
+        self.model.load_state_dict(weights, strict=True)
+        print("Loaded pretrained weights from: ", weights_file)
+        
+        
+    def uncertainty_map(self, x, n_variations=15, sampling_steps=100):
+        """
+        Estimates uncertainty maps for each sample in the input batch using repeated stochastic forward passes.
+
+        For each input sample, the method generates multiple super-resolved outputs by varying the random seed.
+        It then computes the per-pixel standard deviation across these outputs as a proxy for uncertainty.
+        The returned uncertainty map represents the average width of the confidence interval per pixel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W), where B is batch size.
+            n_variations (int): Number of stochastic forward passes per input sample.
+            custom_steps (int): Custom inference steps passed to the forward method.
+
+        Returns:
+            torch.Tensor: Uncertainty maps of shape (B, 1, H, W), where each value indicates pixel-wise uncertainty.
+        """
+        assert n_variations>3, "n_variations must be greater than 3 to compute uncertainty."
+        
+        
+        batch_size = x.shape[0]
+        rand_seed_list = random.sample(range(1, 9999), n_variations)
+
+        all_variations = []
+        for b in range(batch_size):
+            variations = []
+            x_b = x[b].unsqueeze(0)  # shape (1, 4, 512, 512)
+            for seed in rand_seed_list:
+                with suppress_stdout():
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    random.seed(seed)
+                    #pytorch_lightning.utilities.seed.seed_everything(seed=seed, workers=True)
+
+                sr = self.forward(x_b, sampling_steps=sampling_steps,sampling_eta=0.0)  # shape (1, C, H, W)
+                variations.append(sr.detach().cpu())
+
+            variations = torch.stack(variations)  # (n_variations, 1, C, H, W)
+            srs_mean = variations.mean(dim=0)
+            srs_stdev = variations.std(dim=0)
+            interval_size = (srs_stdev * 2).mean(dim=1)  # mean over channels
+
+            all_variations.append(interval_size)  # each is (1, H, W)
+
+        result = torch.stack(all_variations)  # (B, 1, H, W)
+        return result
+    
+    
+
     def _attribution_methods(
         self,
         X: torch.Tensor,
         grads: torch.Tensor,
         attribution_method: Literal[
             "grad_x_input", "max_grad", "mean_grad", "min_grad"            
-        ],
-    ):
+                        ],
+                    ):
+        """
+        DEPRECIATED; SUBJECT TO REMOVAL
+        """
         if attribution_method == "grad_x_input":
             return torch.norm(grads * X, dim=(0, 1))
         elif attribution_method == "max_grad":
@@ -193,7 +360,7 @@ class SRLatentDiffusion(torch.nn.Module):
         self,
         X: torch.Tensor,
         mask: torch.Tensor,
-        eta: float = 1.0,
+        eta: float = 0.0,
         temperature: float = 1.0,
         custom_steps: int = 100,
         steps_to_consider_for_attributions: list = list(range(100)),
@@ -203,7 +370,10 @@ class SRLatentDiffusion(torch.nn.Module):
         verbose: bool = False,
         enable_checkpoint = True,
         histogram_matching=True        
-    ):  
+            ):  
+        """
+        DEPRECIATED; SUBJECT TO REMOVAL
+        """
         # Normalize and encode the LR image
         X = X.clone()
         Xnorm = self._tensor_encode(X)
@@ -267,133 +437,6 @@ class SRLatentDiffusion(torch.nn.Module):
         
         return container
 
-    @torch.no_grad()
-    def forward(
-        self,
-        X: torch.Tensor,
-        eta: float = 1.0,
-        custom_steps: int = 100,
-        temperature: float = 1.0,
-        histogram_matching: bool = True,
-        save_iterations: bool = False,
-        verbose: bool = False
-    ):
-        """Obtain the super resolution of the given image.
-
-        Args:
-            X (torch.Tensor): If a Sentinel-2 L2A image with reflectance values
-                in the range [0, 1] and shape CxWxH, the super resolution of the image
-                is returned. If a batch of images with shape BxCxWxH is given, a batch
-                of super resolved images is returned.
-            custom_steps (int, optional): Number of steps to run the denoiser. Defaults
-                to 100.
-            temperature (float, optional): Temperature to use in the denoiser.
-                Defaults to 1.0. The higher the temperature, the more stochastic
-                the denoiser is (random noise gets multiplied by this).
-            spectral_correction (bool, optional): Apply spectral correction to the SR
-                image, using the LR image as reference. Defaults to True.
-
-        Returns:
-            torch.Tensor: The super resolved image or batch of images with a shape of
-                Cx(Wx4)x(Hx4) or BxCx(Wx4)x(Hx4).
-        """
-        
-        # Assert shape, size, dimensionality
-        X,padding = assert_tensor_validity(X)
-
-        # Normalize the image
-        X = X.clone()
-        Xnorm = self._tensor_encode(X)
-        
-        # ddim, latent and time_range
-        ddim, latent, time_range = self._prepare_model(
-            X=Xnorm, eta=eta, custom_steps=custom_steps, verbose=verbose
-        )
-        iterator = tqdm(time_range, desc="DDIM Sampler", total=custom_steps,disable=True)
-
-        # Iterate over the timesteps
-        if save_iterations:
-            save_iters = []
-            
-        for i, step in enumerate(iterator):
-            outs = ddim.p_sample_ddim(
-                x=latent,
-                c=Xnorm,
-                t=step,
-                index=custom_steps - i - 1,
-                use_original_steps=False,
-                temperature=temperature
-            )
-            latent, _ = outs
-            
-            if save_iterations:
-                save_iters.append(
-                    self._tensor_decode(latent, spe_cor=histogram_matching)
-                )
-        
-        if save_iterations:
-            return save_iters
-        
-        sr = self._tensor_decode(latent, spe_cor=histogram_matching)
-        sr = revert_padding(sr,padding)
-        return sr
-
-
-    def hq_histogram_matching(
-        self, image1: torch.Tensor, image2: torch.Tensor
-    ) -> torch.Tensor:
-        """Lazy implementation of histogram matching
-
-        Args:
-            image1 (torch.Tensor): The low-resolution image (C, H, W).
-            image2 (torch.Tensor): The super-resolved image (C, H, W).
-
-        Returns:
-            torch.Tensor: The super-resolved image with the histogram of
-                the target image.
-        """
-
-        # Go to numpy
-        np_image1 = image1.detach().cpu().numpy()
-        np_image2 = image2.detach().cpu().numpy()
-
-        if np_image1.ndim == 3:
-            np_image1_hat = match_histograms(np_image1, np_image2, channel_axis=0)
-        elif np_image1.ndim == 2:
-            np_image1_hat = match_histograms(np_image1, np_image2, channel_axis=None)
-        else:
-            raise ValueError("The input image must have 2 or 3 dimensions.")
-
-        # Go back to torch
-        image1_hat = torch.from_numpy(np_image1_hat).to(image1.device)
-
-        return image1_hat
-
-    def load_pretrained(self, weights_file: str):
-        """
-        Loads the pretrained model from the given path.
-        """
-
-        # download pretrained model
-        #hf_model = "https://huggingface.co/isp-uv-es/opensr-model/resolve/main/sr_checkpoint.ckpt" # original one
-        # create download link based on input 
-        hf_model = str("https://huggingface.co/simon-donike/RS-SR-LTDF/resolve/main/"+str(weights_file))
-        
-        # download pretrained model
-        if not pathlib.Path(weights_file).exists():
-            print("Downloading pretrained weights from: ", hf_model)
-            with open(weights_file, "wb") as f:
-                f.write(requests.get(hf_model).content)
-
-        weights = torch.load(weights_file, map_location=self.device)["state_dict"]
-
-        # Remote perceptual tensors from weights
-        for key in list(weights.keys()):
-            if "loss" in key:
-                del weights[key]
-
-        self.model.load_state_dict(weights, strict=True)
-        print("Loaded pretrained weights from: ", weights_file)
 
 
 # -----------------------------------------------------------------------------
@@ -409,141 +452,31 @@ class SRLatentDiffusionLightning(LightningModule):
     """
     This Pytorch Lightning Class wraps around the torch model to
     aid in distrubuted GPU processing and optimized dataloaders
-    provided by PL.
+    provided by PL. ToDo: implement demo showcase
     """
-    def __init__(self,bands: str = "10m", device: Union[str, torch.device] = "cpu",
-                 custom_steps: int = 100, temperature: float = 1.0):
+    def __init__(self,config, device: Union[str, torch.device] = "cpu"):
         super().__init__()
-        self.model = SRLatentDiffusion(bands=bands,device=device)
+        self.model = SRLatentDiffusion(config,device=device)
         self.model = self.model.eval()
-        self.custom_steps = custom_steps
-        self.temperature = temperature
-        self.predict_dataset = None
-        self.mode = "SR" # setting this hardcoded. If we're in xAI, this will get overwritten externally
 
+    @torch.no_grad()
     def forward(self, x,**kwargs):
         #print("Dont call 'forward' on the PL model, instead use 'predict'")
-        return self.model(x,custom_steps=self.custom_steps)
+        return self.model(x)
     
     def load_pretrained(self, weights_file: str):
         self.model.load_pretrained(weights_file)
         print("PL Model: Model loaded from ", weights_file)
 
+    @torch.no_grad()
     def predict_step(self, x, idx: int = 0,**kwargs):
         # perform SR
         assert self.model.training == False, "Model in Training mode. Abort." # make sure we're in eval
-
-        if self.mode=="SR":
-            p = self.model.forward(x,custom_steps=self.custom_steps,temperature=self.temperature)
-            return(p)
-        if self.mode=="xAI":
-            p = self.xai_step(x, idx)
-            return(p)
+        p = self.model.forward(x)
+        return(p)
     
-    def xai_step(self, x, idx):
-        no_uncertainty = 15 # amount of images to SR
-        rand_seed_list = random.sample(range(1, 9999), no_uncertainty) # list of random seeds
-        variations = [] # empty list to hold variations
-        for i in range(no_uncertainty):
-            # reseed random number generators for each iteration
-            np.random.seed(rand_seed_list[i])
-            torch.manual_seed(rand_seed_list[i])
-            random.seed(rand_seed_list[i])
-            pytorch_lightning.utilities.seed.seed_everything(seed=rand_seed_list[i],workers=True)
-            
-            sr = self.model.forward(x,custom_steps=self.custom_steps)
-            sr = sr.squeeze(0)
-            variations.append(sr.detach().cpu())
-        variations = torch.stack(variations)
-        # Get statistics for xAI
-        srs_mean = variations.mean(dim=0)
-        srs_stdev = variations.std(dim=0)
-        lower_bound = srs_mean-srs_stdev
-        upper_bound = srs_mean+srs_stdev
-        interval_size = srs_stdev*2
-        interval_size = interval_size.mean(dim=0).unsqueeze(0)
-        return interval_size
+    @torch.no_grad()
+    def uncertainty_map(self, x,n_variations=15,custom_steps=100):
+        uncertainty_map = self.model.uncertainty_map(x,n_variations,custom_steps)
+        return(uncertainty_map)
 
-
-"""
-import torch
-import os
-from pytorch_lightning.callbacks import BasePredictionWriter
-class CustomWriter(BasePredictionWriter):
-    
-    #- Applied after each predict step by the predict() of PL model
-    #- this class needs as input the SR object created by opensr-utils
-    #- it writes the results to a temporary folder
-    #- it writes the results to the placeholder file at the end
-    
-    def __init__(self, sr_obj, write_interval="batch"):
-        super().__init__(write_interval)
-        self.sr_obj = sr_obj # save SR obj in class
-
-        # create folder and info to save temporary results
-        base_path = os.path.dirname(self.sr_obj.info_dict["sr_path"])
-        self.temp_path = os.path.join(base_path,"tmp_sr")
-        os.makedirs(self.temp_path, exist_ok=True)
-
-        # if files exist in folder, remove them
-        files = os.listdir(self.temp_path)
-        for file in files:
-            os.remove(os.path.join(self.temp_path,file))
-
-    def write_on_batch_end(self, trainer,
-                           pl_module, prediction,
-                           batch_indices, batch,
-                           batch_idx, dataloader_idx):
-        try:
-            prediction = prediction.cpu()
-        except:
-            pass
-
-        # iterate over predictions and save them accordingly
-        #for pred,idx in zip(prediction,batch_indices):
-        #    self.sr_obj.sr_obj.fill_SR_overlap(pred,idx,self.sr_obj.info_dict)
-
-        # create filename
-        formatted_number_1 = "{:06}".format(batch_indices[0])
-        formatted_number_2 = "{:04d}".format(len(batch_indices))
-        filename = "batch{}__{}batches.pt".format(formatted_number_1,formatted_number_2)
-        # create dictionary out of results and save to disk
-        results_dict = {"sr":prediction,"batch_indices":batch_indices}
-        torch.save(results_dict,os.path.join(self.temp_path,filename))
-        
-        # return nothing in order not to accumulate results
-        return None
-    
-    #def write_all_to_placeholder(self):
-    def on_predict_end(self, trainer, pl_module):
-        
-        #Custom function to be called after all predictions are done
-        
-        # run this only on one GPU
-        if trainer.global_rank == 0:
-            print("Running weighted Patching on Worker:",str(trainer.global_rank),"...")
-            # read all files in folder
-            files = os.listdir(self.temp_path)
-            files = [file for file in files if file.endswith(".pt")] # keep only .pt files
-
-            # iterate over files and save them to placeholder
-            for file in tqdm(files,desc="Saving to PH"):
-                # load file
-                results_dict = torch.load(os.path.join(self.temp_path,file))
-                # iterate over results and save them
-                for pred,idx in zip(results_dict["sr"],results_dict["batch_indices"]):
-                    self.sr_obj.sr_obj.fill_SR_overlap(pred,idx,self.sr_obj.info_dict)
-            
-            # delete temporary folder and all its contents
-            # Make sure the path exists and is a directory
-            if os.path.isdir(self.temp_path):
-                import time 
-                time.sleep(10)
-                # Remove the folder and all its contents
-                shutil.rmtree(self.temp_path)
-                print(f"Data written to disk, temp folder deleted. Finished.")
-            else:
-                print(f"Data written to disk, temp folder not deleted.")
-            return None
-
-"""

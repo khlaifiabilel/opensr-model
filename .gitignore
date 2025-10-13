@@ -1,4 +1,16 @@
 .vscode
+.vscode/*
+*.swp
+other_uncertainty_2.py
+sr_of_s2_tile.py
+creating_usecase_data/
+other_stuff/
+austria.py
+upload_to_drive.py
+client_secret.json
+*.DS_Store
+example_images/
+client_secret.json
 
 *.svg
 old/
@@ -7,7 +19,6 @@ old/*
 *.ckpt
 *.pth
 *.pt
-*.png
 *.ipynb
 *.JSON
 *.json

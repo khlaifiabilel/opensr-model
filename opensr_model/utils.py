@@ -1,6 +1,12 @@
 import torch
 from einops import rearrange
+from matplotlib import pyplot as plt
+import matplotlib
+from scipy.ndimage import gaussian_filter
 
+
+def linear_transform_placeholder(t_input, stage="norm"):
+    return( t_input )
 
 def linear_transform_4b(t_input,stage="norm"):
     assert stage in ["norm","denorm"]
@@ -127,6 +133,9 @@ def assert_tensor_validity(tensor):
     if len(tensor.shape)==3:
         tensor = tensor.unsqueeze(0)
 
+    # Turn NaNs to 0 and Infs to 1
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=1.0)
+
     # ASSERT BxCxHxW ORDER
     # Check the size of the input tensor
     if tensor.shape[-1]<10:
@@ -168,4 +177,147 @@ def revert_padding(tensor,padding):
     # Slice the tensor to remove padding
     unpadded_tensor = tensor[:,:, start_height:end_height, start_width:end_width]
     return unpadded_tensor
+
+
+
+def create_no_data_mask(X,target_size = 512):
+    """
+    Create a mask for no-data values in the input tensor.
+    No-data values are defined as those equal to 0.
+    
+    Args:
+        X (torch.Tensor): Input tensor of shape (B, C, H, W).
+        
+    Returns:
+        torch.Tensor: Mask of shape (B, C, H, W) where no-data values are marked as True.
+    """
+    # Create a mask where no-data values are True
+    interpolated_X = torch.nn.functional.interpolate(X, size=(target_size,target_size), mode='nearest')
+    mask = (interpolated_X == 0).float()
+    return mask
+
+def apply_no_data_mask(X, mask):
+    """
+    Apply a no-data mask to the input tensor.
+    
+    Args:
+        X (torch.Tensor): Input tensor of shape (B, C, H, W).
+        mask (torch.Tensor): Mask of shape (B, C, H, W) where no-data values are marked as True.
+        
+    Returns:
+        torch.Tensor: Tensor with no-data values set to 0.
+    """
+    # Apply the mask to set no-data values to 0
+    X_masked = X * (1 - mask)
+    return X_masked
+
+
+import matplotlib.pyplot as plt
+from einops import rearrange
+
+def plot_example(lr, sr, out_file="example.png"):
+    # Scale and clamp
+    sr = sr.cpu() * 3.5
+    sr = sr.clamp(0.001, 0.9999)
+    lr = lr.cpu() * 3.5
+    lr = lr.clamp(0.001, 0.9999)
+
+    # Convert to HWC NumPy
+    lr_img = rearrange(lr[0, :3, :, :], 'c h w -> h w c').numpy()
+    sr_img = rearrange(sr[0, :3, :, :], 'c h w -> h w c').numpy()
+
+    # Center crop 32x32
+    def center_crop(img, size=32):
+        h, w, _ = img.shape
+        top = (h - size) // 2
+        left = (w - size) // 2
+        return img[top:top+size, left:left+size, :]
+
+    lr_crop = center_crop(lr_img)
+    sr_crop = center_crop(sr_img, size=32*4)
+
+    # Plot 2 rows × 2 columns
+    fig, ax = plt.subplots(2, 2, figsize=(10, 10))
+    ax[0, 0].imshow(lr_img)
+    ax[0, 0].set_title("LR (RGB) - 4x128x128")
+    ax[0, 1].imshow(sr_img)
+    ax[0, 1].set_title("SR (RGB) - 4x512x512")
+    ax[1, 0].imshow(lr_crop)
+    ax[1, 0].set_title("LR Detail - 32x32")
+    ax[1, 1].imshow(sr_crop)
+    ax[1, 1].set_title("SR Detail - 128x128")
+
+    for a in ax.flatten():
+        a.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(out_file)
+    plt.close()
+    
+
+def plot_uncertainty(uncertainty_map,out_file="uncertainty_map.png",normalize=True):
+    uncertainty_map = uncertainty_map.cpu()
+    img = rearrange(uncertainty_map[0, :, :, :], 'c h w -> h w c').numpy()
+    
+    # Convert to grayscale if single-channel
+    if img.shape[2] == 1:
+        img = img[:, :, 0]
+
+    if normalize:
+        # Stretch to [0, 1]
+        img_min = img.min()
+        img_max = img.max()
+        img = (img - img_min) / (img_max - img_min + 1e-8)
+    
+    # apply gaussian to smoothen visualization
+    img = gaussian_filter(img, sigma=1.0)
+
+    # plot image
+    fig, ax = plt.subplots(figsize=(7, 7))
+    im = ax.imshow(img, cmap='RdYlGn_r')
+    ax.set_title("Uncertainty Map")
+    label = "Uncertainty (Normalized)" if normalize else "Uncertainty (Absolute)"
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=label)
+    plt.tight_layout()
+    plt.savefig(out_file)
+    plt.close()
+
+
+def download_from_HF(file_name="example_lr.pt"):
+    """
+    Downloads an example low-resolution tensor from the Hugging Face Hub.
+    This function uses the `hf_hub_download` function to fetch a sample tensor
+    for testing purposes.
+    
+    Returns:
+        torch.Tensor: The downloaded low-resolution tensor.
+    """
+    from huggingface_hub import hf_hub_download
+    import torch
+    
+
+    # Download the file from your HF model repo
+    file_path = hf_hub_download(
+        repo_id="simon-donike/RS-SR-LTDF",
+        filename=file_name,
+        repo_type="model"  # or "dataset" if it's in a dataset repo
+    )
+
+    # Load the tensor
+    obj = torch.load(file_path)
+    return(obj)
+
+import contextlib
+import os
+import sys
+@contextlib.contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+
 
